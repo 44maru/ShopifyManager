@@ -1,0 +1,6 @@
+[ApiInfo]
+apiKey = "dummy"
+apiPassword = "dummy"
+
+[Thread]
+threadNum = 1
