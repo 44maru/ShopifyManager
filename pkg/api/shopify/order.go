@@ -15,7 +15,7 @@ import (
 
 type GetOrdersResponse struct {
 	Orders []struct {
-		ID                    int         `json:"id"`
+		ID                    int64       `json:"id"`
 		Email                 string      `json:"email"`
 		ClosedAt              interface{} `json:"closed_at"`
 		CreatedAt             string      `json:"created_at"`
@@ -606,6 +606,11 @@ type GetOrdersResponse struct {
 		} `json:"refunds"`
 	} `json:"orders"`
 }
+
+type CancelOrderRequest struct {
+	Email bool `json:"email"`
+}
+
 type CancelOrderResponse struct {
 	Order struct {
 		ID                    int         `json:"id"`
@@ -1205,7 +1210,7 @@ type CreateTransactionRequest struct {
 		Currency string `json:"currency"`
 		Amount   string `json:"amount"`
 		Kind     string `json:"kind"`
-		ParentID int    `json:"parent_id"`
+		ParentID int64  `json:"parent_id"`
 	} `json:"transaction"`
 }
 
@@ -1236,6 +1241,42 @@ type CreateTransactionResponse struct {
 	} `json:"transaction"`
 }
 
+type GetTransactionResponse struct {
+	Transactions []struct {
+		ID            int64       `json:"id"`
+		OrderID       int         `json:"order_id"`
+		Kind          string      `json:"kind"`
+		Gateway       string      `json:"gateway"`
+		Status        string      `json:"status"`
+		Message       interface{} `json:"message"`
+		CreatedAt     string      `json:"created_at"`
+		Test          bool        `json:"test"`
+		Authorization string      `json:"authorization"`
+		LocationID    interface{} `json:"location_id"`
+		UserID        interface{} `json:"user_id"`
+		ParentID      int         `json:"parent_id"`
+		ProcessedAt   string      `json:"processed_at"`
+		DeviceID      interface{} `json:"device_id"`
+		Receipt       struct {
+			Testcase      bool   `json:"testcase"`
+			Authorization string `json:"authorization"`
+		} `json:"receipt"`
+		ErrorCode                  interface{} `json:"error_code"`
+		SourceName                 string      `json:"source_name"`
+		CurrencyExchangeAdjustment interface{} `json:"currency_exchange_adjustment"`
+		Amount                     string      `json:"amount"`
+		Currency                   string      `json:"currency"`
+		AdminGraphqlAPIID          string      `json:"admin_graphql_api_id"`
+		PaymentDetails             struct {
+			CreditCardBin     interface{} `json:"credit_card_bin"`
+			AvsResultCode     interface{} `json:"avs_result_code"`
+			CvvResultCode     interface{} `json:"cvv_result_code"`
+			CreditCardNumber  string      `json:"credit_card_number"`
+			CreditCardCompany string      `json:"credit_card_company"`
+		} `json:"payment_details,omitempty"`
+	} `json:"transactions"`
+}
+
 func CancelOrders(config *config.Config) error {
 	isSuccess := true
 	cancelOrderNumberList, err := getOrderNumberList(constants.INPUT_EXCEL_FILE_PATH)
@@ -1250,22 +1291,35 @@ func CancelOrders(config *config.Config) error {
 		limitCh <- struct{}{}
 		go func(orderNumber int) {
 			defer wg.Done()
+
+			log.Printf("INFO : Try to get order by orderNumber '%d'\n", orderNumber)
 			order, err := getOrder(orderNumber, config)
 			if err != nil {
-				log.Printf("ERROR : orderNumber '%d' failed to cancel. %s\n", orderNumber, err.Error())
+				log.Printf("ERROR : orderNumber '%d' failed to cancel due to coludn't get order. %s\n", orderNumber, err.Error())
 				isSuccess = false
 				<-limitCh
 				return
 			}
 
-			_, err = disabeAuthorization(order.Orders[0].ID, config)
+			log.Printf("INFO : Try to get transactionId by orderId '%d' (orderNumber '%d')\n", order.Orders[0].ID, orderNumber)
+			transactionId, err := getTransactionId(order.Orders[0].ID, config)
 			if err != nil {
-				log.Printf("ERROR : orderNumber '%d' failed to cancel. %s\n", orderNumber, err.Error())
+				log.Printf("ERROR : orderNumber '%d' failed to cancel due to couldn't get transactionId. %s\n", orderNumber, err.Error())
 				isSuccess = false
 				<-limitCh
 				return
 			}
 
+			log.Printf("INFO : Try to disable authorization by orderId '%d' and transactionId '%d' (orderNumber '%d')\n", order.Orders[0].ID, transactionId, orderNumber)
+			_, err = disabeAuthorization(order.Orders[0].ID, transactionId, config)
+			if err != nil {
+				log.Printf("ERROR : orderNumber '%d' failed to cancel due to coludn't be disable auhtorization. %s\n", orderNumber, err.Error())
+				isSuccess = false
+				<-limitCh
+				return
+			}
+
+			log.Printf("INFO : Try to cancel order by orderId '%d' (orderNumber '%d')\n", order.Orders[0].ID, orderNumber)
 			_, err = cancelOrder(order.Orders[0].ID, config)
 			if err != nil {
 				log.Printf("ERROR : orderNumber '%d' failed to cancel. %s\n", orderNumber, err.Error())
@@ -1285,13 +1339,13 @@ func CancelOrders(config *config.Config) error {
 	if isSuccess {
 		return nil
 	} else {
-		return fmt.Errorf("Failed to delete any of instance.")
+		return fmt.Errorf("Failed to cancel any of orders.")
 	}
 }
 
-func getOrder(orderId int, config *config.Config) (*GetOrdersResponse, error) {
+func getOrder(orderNumber int, config *config.Config) (*GetOrdersResponse, error) {
 
-	getOrderUrl := fmt.Sprintf(constants.GET_ORDER_URL_TEMPLATE, config.ApiInfo.ApiKey, config.ApiInfo.ApiPassword, orderId)
+	getOrderUrl := fmt.Sprintf(constants.GET_ORDER_URL_TEMPLATE, config.ApiInfo.ApiKey, config.ApiInfo.ApiPassword, orderNumber)
 	httpReqHeader := map[string]string{}
 	httpReqHeader["Content-Type"] = "application/json"
 	jsonRes, err := http.Get(getOrderUrl, nil, httpReqHeader)
@@ -1307,18 +1361,25 @@ func getOrder(orderId int, config *config.Config) (*GetOrdersResponse, error) {
 	}
 
 	if len(orderResponse.Orders) < 1 {
-		return nil, fmt.Errorf("Not found Order by order number '%d'", orderId)
+		return nil, fmt.Errorf("Not found Order by order number '%d'", orderNumber)
 	}
 
 	return orderResponse, nil
 }
 
-func cancelOrder(cancelOrderId int, config *config.Config) (*CancelOrderResponse, error) {
+func cancelOrder(cancelOrderId int64, config *config.Config) (*CancelOrderResponse, error) {
+	cancelOrderReq := new(CancelOrderRequest)
+	cancelOrderReq.Email = true
+	reqJsonBytes, err := json.MarshalIndent(cancelOrderReq, "", "  ")
+	if err != nil {
+		log.Println("Cancel order request json marshal error")
+		return nil, err
+	}
 
 	cancelOrderUrl := fmt.Sprintf(constants.CANCEL_ORDER_URL_TEMPLATE, config.ApiInfo.ApiKey, config.ApiInfo.ApiPassword, cancelOrderId)
 	httpReqHeader := map[string]string{}
 	httpReqHeader["Content-Type"] = "application/json"
-	jsonRes, err := http.Post(cancelOrderUrl, nil, httpReqHeader)
+	jsonRes, err := http.Post(cancelOrderUrl, reqJsonBytes, httpReqHeader)
 	if err != nil {
 		return nil, err
 	}
@@ -1333,20 +1394,18 @@ func cancelOrder(cancelOrderId int, config *config.Config) (*CancelOrderResponse
 	return cancelOrderResponse, nil
 }
 
-func disabeAuthorization(cancelOrderId int, config *config.Config) (*CreateTransactionResponse, error) {
-	// TODO get auhtoriazation transactionId using checkout_token of order response.
-	// https://penguin-auto-buy-service.myshopify.com/admin/api/2020-07/checkouts/6b414822434d49198f5bc69bab780542/payments.json
+func disabeAuthorization(orderId, transactionId int64, config *config.Config) (*CreateTransactionResponse, error) {
 
 	createTransactionReq := new(CreateTransactionRequest)
 	createTransactionReq.Transaction.Kind = "void"
 	createTransactionReq.Transaction.Currency = "JPY"
-	createTransactionReq.Transaction.ParentID = 3349918253213
+	createTransactionReq.Transaction.ParentID = transactionId
 	reqJsonBytes, err := json.MarshalIndent(createTransactionReq, "", "  ")
 	if err != nil {
 		log.Println("Create transaction request json marshal error")
 		return nil, err
 	}
-	createTransactionUrl := fmt.Sprintf(constants.TRANSACTIONS_URL_TEMPLATE, config.ApiInfo.ApiKey, config.ApiInfo.ApiPassword, cancelOrderId)
+	createTransactionUrl := fmt.Sprintf(constants.TRANSACTIONS_URL_TEMPLATE, config.ApiInfo.ApiKey, config.ApiInfo.ApiPassword, orderId)
 	httpReqHeader := map[string]string{}
 	httpReqHeader["Content-Type"] = "application/json"
 	jsonRes, err := http.Post(createTransactionUrl, reqJsonBytes, httpReqHeader)
@@ -1398,4 +1457,34 @@ func getOrderNumberList(excelFilePath string) ([]int, error) {
 	}
 
 	return orderIdList, nil
+}
+
+func getTransactionId(orderId int64, config *config.Config) (int64, error) {
+
+	getTransactionUrl := fmt.Sprintf(constants.TRANSACTIONS_URL_TEMPLATE, config.ApiInfo.ApiKey, config.ApiInfo.ApiPassword, orderId)
+	httpReqHeader := map[string]string{}
+	httpReqHeader["Content-Type"] = "application/json"
+	jsonRes, err := http.Get(getTransactionUrl, nil, httpReqHeader)
+	if err != nil {
+		return -1, err
+	}
+
+	getTransactionRes := new(GetTransactionResponse)
+	err = json.Unmarshal(jsonRes, &getTransactionRes)
+	if err != nil {
+		log.Println("Get payment response json unmarshal err")
+		return -1, err
+	}
+
+	if len(getTransactionRes.Transactions) < 1 {
+		return -1, fmt.Errorf("Not found transaction by orderId '%d'", orderId)
+	}
+
+	for _, transaction := range getTransactionRes.Transactions {
+		if transaction.Kind == "authorization" {
+			return transaction.ID, nil
+		}
+	}
+
+	return -1, fmt.Errorf("Found transaction but no exists authorization type transaction")
 }

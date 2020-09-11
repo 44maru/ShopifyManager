@@ -15,5 +15,5 @@ func CancelOrders(config *config.Config) {
 		return
 	}
 
-	log.Println("インスタンス作成処理成功")
+	log.Println("キャンセル処理成功")
 }
