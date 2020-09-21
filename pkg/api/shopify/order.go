@@ -1481,7 +1481,7 @@ func getTransactionId(orderId int64, config *config.Config) (int64, error) {
 	}
 
 	for _, transaction := range getTransactionRes.Transactions {
-		if transaction.Kind == "authorization" {
+		if transaction.Kind == "authorization" && transaction.Status == "success" {
 			return transaction.ID, nil
 		}
 	}
